@@ -6,13 +6,24 @@ const svgr = require('@svgr/core').default
 const babel = require('@babel/core')
 const { compile: compileVue } = require('@vue/compiler-dom')
 const { dirname } = require('path')
+const { deprecated } = require('./deprecated')
 
 let transform = {
-  react: async (svg, componentName, format) => {
+  react: async (svg, componentName, format, isDeprecated) => {
     let component = await svgr(svg, { ref: true, titleProp: true }, { componentName })
     let { code } = await babel.transformAsync(component, {
       plugins: [[require('@babel/plugin-transform-react-jsx'), { useBuiltIns: true }]],
     })
+
+    // Add a deprecation warning to the component
+    if (isDeprecated) {
+      /** @type {string[]} */
+      let lines = code.split('\n')
+      lines.splice(1, 0, `/** @deprecated */`)
+      code = lines.join('\n')
+    }
+
+    code = code.replace('React.forwardRef(', '/*#__PURE__*/ React.forwardRef(')
 
     if (format === 'esm') {
       return code
@@ -22,10 +33,18 @@ let transform = {
       .replace('import * as React from "react"', 'const React = require("react")')
       .replace('export default', 'module.exports =')
   },
-  vue: (svg, componentName, format) => {
+  vue: (svg, componentName, format, isDeprecated) => {
     let { code } = compileVue(svg, {
       mode: 'module',
     })
+
+    // Add a deprecation warning to the component
+    if (isDeprecated) {
+      /** @type {string[]} */
+      let lines = code.split('\n')
+      lines.splice(2, 0, `/** @deprecated */`)
+      code = lines.join('\n')
+    }
 
     if (format === 'esm') {
       return code.replace('export function', 'export default function')
@@ -55,6 +74,7 @@ async function getIcons(style) {
       componentName: `${camelcase(file.replace(/\.svg$/, ''), {
         pascalCase: true,
       })}Icon`,
+      isDeprecated: deprecated.includes(file),
     }))
   )
 }
@@ -77,7 +97,7 @@ async function ensureWrite(file, text) {
 }
 
 async function ensureWriteJson(file, json) {
-  await ensureWrite(file, JSON.stringify(json, null, 2))
+  await ensureWrite(file, JSON.stringify(json, null, 2) + '\n')
 }
 
 async function buildIcons(package, style, format) {
@@ -89,16 +109,31 @@ async function buildIcons(package, style, format) {
   let icons = await getIcons(style)
 
   await Promise.all(
-    icons.flatMap(async ({ componentName, svg }) => {
-      let content = await transform[package](svg, componentName, format)
-      let types =
-        package === 'react'
-          ? `import * as React from 'react';\ndeclare const ${componentName}: React.ForwardRefExoticComponent<React.SVGProps<SVGSVGElement> & { title?: string, titleId?: string }>;\nexport default ${componentName};\n`
-          : `import type { FunctionalComponent, HTMLAttributes, VNodeProps } from 'vue';\ndeclare const ${componentName}: FunctionalComponent<HTMLAttributes & VNodeProps>;\nexport default ${componentName};\n`
+    icons.flatMap(async ({ componentName, svg, isDeprecated }) => {
+      let content = await transform[package](svg, componentName, format, isDeprecated)
+
+      /** @type {string[]} */
+      let types = []
+
+      if (package === 'react') {
+        types.push(`import * as React from 'react';`)
+        if (isDeprecated) {
+          types.push(`/** @deprecated */`)
+        }
+        types.push(`declare const ${componentName}: React.ForwardRefExoticComponent<React.PropsWithoutRef<React.SVGProps<SVGSVGElement>> & { title?: string, titleId?: string } & React.RefAttributes<SVGSVGElement>>;`)
+        types.push(`export default ${componentName};`)
+      } else {
+        types.push(`import type { FunctionalComponent, HTMLAttributes, VNodeProps } from 'vue';`)
+        if (isDeprecated) {
+          types.push(`/** @deprecated */`)
+        }
+        types.push(`declare const ${componentName}: FunctionalComponent<HTMLAttributes & VNodeProps>;`)
+        types.push(`export default ${componentName};`)
+      }
 
       return [
         ensureWrite(`${outDir}/${componentName}.js`, content),
-        ...(types ? [ensureWrite(`${outDir}/${componentName}.d.ts`, types)] : []),
+        ...(types ? [ensureWrite(`${outDir}/${componentName}.d.ts`, types.join("\n") + "\n")] : []),
       ]
     })
   )
@@ -121,43 +156,43 @@ async function buildExports(styles) {
   }
 
   // For those that want to read the version from package.json
-  pkg[`./package.json`] = { "default": "./package.json" }
+  pkg[`./package.json`] = { default: './package.json' }
 
   // Backwards compatibility with v1 imports (points to proxy that prints an error message):
-  pkg["./outline"] = { "default": "./outline/index.js" }
-  pkg["./outline/index"] = { "default": "./outline/index.js" }
-  pkg["./outline/index.js"] = { "default": "./outline/index.js" }
-  pkg["./solid"] = { "default": "./solid/index.js" }
-  pkg["./solid/index"] = { "default": "./solid/index.js" }
-  pkg["./solid/index.js"] = { "default": "./solid/index.js" }
+  pkg['./outline'] = { default: './outline/index.js' }
+  pkg['./outline/index'] = { default: './outline/index.js' }
+  pkg['./outline/index.js'] = { default: './outline/index.js' }
+  pkg['./solid'] = { default: './solid/index.js' }
+  pkg['./solid/index'] = { default: './solid/index.js' }
+  pkg['./solid/index.js'] = { default: './solid/index.js' }
 
   // Explicit exports for each style:
   for (let style of styles) {
     pkg[`./${style}`] = {
-      "types": `./${style}/index.d.ts`,
-      "import": `./${style}/index.js`,
-      "require": `./${style}/index.js`
+      types: `./${style}/index.d.ts`,
+      import: `./${style}/esm/index.js`,
+      require: `./${style}/index.js`,
     }
     pkg[`./${style}/*`] = {
-      "types": `./${style}/*.d.ts`,
-      "import": `./${style}/esm/*.js`,
-      "require": `./${style}/*.js`
+      types: `./${style}/*.d.ts`,
+      import: `./${style}/esm/*.js`,
+      require: `./${style}/*.js`,
     }
     pkg[`./${style}/*.js`] = {
-      "types": `./${style}/*.d.ts`,
-      "import": `./${style}/esm/*.js`,
-      "require": `./${style}/*.js`
+      types: `./${style}/*.d.ts`,
+      import: `./${style}/esm/*.js`,
+      require: `./${style}/*.js`,
     }
 
     // This dir is basically an implementation detail, but it's needed for
     // backwards compatibility in case people were importing from it directly.
     pkg[`./${style}/esm/*`] = {
-      "types": `./${style}/*.d.ts`,
-      "import": `./${style}/esm/*.js`
+      types: `./${style}/*.d.ts`,
+      import: `./${style}/esm/*.js`,
     }
     pkg[`./${style}/esm/*.js`] = {
-      "types": `./${style}/*.d.ts`,
-      "import": `./${style}/esm/*.js`
+      types: `./${style}/*.d.ts`,
+      import: `./${style}/esm/*.js`,
     }
   }
 
@@ -171,18 +206,23 @@ async function main(package) {
   console.log(`Building ${package} package...`)
 
   await Promise.all([
+    rimraf(`./${package}/16/solid/*`),
     rimraf(`./${package}/20/solid/*`),
     rimraf(`./${package}/24/outline/*`),
     rimraf(`./${package}/24/solid/*`),
   ])
 
   await Promise.all([
+    buildIcons(package, '16/solid', 'cjs'),
+    buildIcons(package, '16/solid', 'esm'),
     buildIcons(package, '20/solid', 'cjs'),
     buildIcons(package, '20/solid', 'esm'),
     buildIcons(package, '24/outline', 'cjs'),
     buildIcons(package, '24/outline', 'esm'),
     buildIcons(package, '24/solid', 'cjs'),
     buildIcons(package, '24/solid', 'esm'),
+    ensureWriteJson(`./${package}/16/solid/esm/package.json`, esmPackageJson),
+    ensureWriteJson(`./${package}/16/solid/package.json`, cjsPackageJson),
     ensureWriteJson(`./${package}/20/solid/esm/package.json`, esmPackageJson),
     ensureWriteJson(`./${package}/20/solid/package.json`, cjsPackageJson),
     ensureWriteJson(`./${package}/24/outline/esm/package.json`, esmPackageJson),
@@ -193,11 +233,7 @@ async function main(package) {
 
   let packageJson = JSON.parse(await fs.readFile(`./${package}/package.json`, 'utf8'))
 
-  packageJson.exports = await buildExports([
-    '20/solid',
-    '24/outline',
-    '24/solid',
-  ])
+  packageJson.exports = await buildExports(['16/solid', '20/solid', '24/outline', '24/solid'])
 
   await ensureWriteJson(`./${package}/package.json`, packageJson)
 
